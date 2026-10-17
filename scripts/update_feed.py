@@ -1,53 +1,112 @@
 #!/usr/bin/env python3
-"""Read an expressly authorized CSV endpoint and update a validated public JSON feed.
-No source URL is embedded, searched or scraped. Configuration via secrets only.
-"""
-import csv,io,json,os,sys,urllib.request
-from datetime import date,datetime,timezone
-from pathlib import Path
-from decimal import Decimal,InvalidOperation
+"""Update the Nikkei calendar from an explicitly authorized CSV endpoint.
 
-ROOT=Path(__file__).resolve().parents[1]
-URL=os.environ.get('AUTHORIZED_NIKKEI_CSV_URL','').strip()
-SOURCE=os.environ.get('AUTHORIZED_NIKKEI_SOURCE_NAME','').strip()
+URL is deliberately NOT embedded. Confirm permission for automated retrieval,
+processing, and public redistribution before setting GitHub secrets.
+"""
+import csv
+import io
+import json
+import os
+import sys
+import urllib.request
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+URL = os.getenv('AUTHORIZED_NIKKEI_CSV_URL', '').strip()
+SOURCE = os.getenv('AUTHORIZED_NIKKEI_SOURCE_NAME', '').strip()
 if not URL or not SOURCE:
-    print('未設定: 配信元URLと出典名を設定するまで取得しません')
+    print('未設定: 自動取得・保存・公開が許可された配信URLと出典名が必要です')
     sys.exit(0)
 if not URL.startswith('https://'):
-    sys.exit('HTTPS の配信URLのみ許可します')
-try:
-    req=urllib.request.Request(URL,headers={'User-Agent':'PersonalNikkeiCalendar/0.4 (authorized CSV feed)'})
-    with urllib.request.urlopen(req,timeout=25) as resp:
-        raw=resp.read(20_000_001)
-    if len(raw)>20_000_000:raise ValueError('ファイルサイズが20MBを超えました')
-    text=raw.decode('utf-8-sig')
-    reader=csv.DictReader(io.StringIO(text))
-    required={'date','open','high','low','close'}
-    if not reader.fieldnames or not required.issubset({s.strip() for s in reader.fieldnames}):raise ValueError('CSVの列が不足: date,open,high,low,close')
-    rows={}
-    for r in reader:
-        date_key=r['date'].strip()
-        parsed=date.fromisoformat(date_key)
-        if parsed.isoformat()!=date_key or parsed>datetime.now(timezone.utc).date():raise ValueError('日付が不正: '+date_key)
-        p={k:float(Decimal(r[k].strip())) for k in ('open','high','low','close')}
-        if not all(0<v<1_000_000_000 for v in p.values()):raise ValueError('価格が不正')
-        if p['high']<max(p.values()) or p['low']>min(p.values()):raise ValueError('OHLCが不正')
-        if date_key in rows:raise ValueError('同一ファイル内で日付重複: '+date_key)
-        rows[date_key]={'date':date_key,**p}
-    if not rows:raise ValueError('データが空です')
-    destination=ROOT/'data'/'nikkei.json'
-    # Keep previously verified history. A truncated daily feed never deletes it.
-    if destination.exists():
-        current=json.loads(destination.read_text())
-        if current.get('schema')==1 and isinstance(current.get('rows'),list):
-            for old in current['rows']:
-                if old['date'] not in rows:rows[old['date']]=old
-    clean=[rows[k] for k in sorted(rows)]
-    payload={'schema':1,'status':'ready','source':SOURCE,'updated_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'rows':clean}
-    temp=destination.with_suffix('.json.tmp')
-    temp.write_text(json.dumps(payload,ensure_ascii=False,separators=(',',':'))+'\n')
-    temp.replace(destination)
-    print('正常に更新:',len(clean),'件、最新日:',clean[-1]['date'])
-except Exception as e:
-    print('取得・検証エラー。前回の公開データは変更しません:',str(e),file=sys.stderr)
-    sys.exit(1)
+    sys.exit('HTTPS の配信URLのみ利用できます')
+
+
+def parse_csv(raw):
+    # Nikkei's official Japanese CSV is usually Shift_JIS/CP932 and has a
+    # single non-tabular copyright notice following the last data row.
+    decoded = None
+    for encoding in ('utf-8-sig', 'cp932'):
+        try:
+            decoded = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            pass
+    if decoded is None:
+        raise ValueError('CSVの文字コードを判定できません')
+    reader = csv.reader(io.StringIO(decoded))
+    header = next(reader, None)
+    columns = {
+        'date': ('データ日付', 'date'),
+        'open': ('始値', 'open'),
+        'high': ('高値', 'high'),
+        'low': ('安値', 'low'),
+        'close': ('終値', 'close'),
+    }
+    if not header:
+        raise ValueError('CSVに見出しがありません')
+    names = [x.strip().lstrip('\ufeff') for x in header]
+    idx = {}
+    for key, choices in columns.items():
+        found = next((names.index(c) for c in choices if c in names), None)
+        if found is None:
+            raise ValueError('CSVの列が不足しています: ' + key)
+        idx[key] = found
+    rows = {}
+    for row in reader:
+        if not row or all(not item.strip() for item in row):
+            continue
+        # A single-column rights notice at the end is not a price record.
+        if len(row) == 1 and ('著作' in row[0] or '無断' in row[0]):
+            continue
+        if len(row) != len(names):
+            raise ValueError('不正な列数のCSV行が含まれています')
+        ds = row[idx['date']].strip().replace('/', '-').replace('.', '-')
+        day = date.fromisoformat(ds)
+        if day > datetime.now(timezone.utc).date():
+            raise ValueError('未来のデータが含まれています')
+        values = {k: float(Decimal(row[idx[k]].strip().replace(',', ''))) for k in ('open', 'high', 'low', 'close')}
+        if not all(0 < v < 1000000000 for v in values.values()):
+            raise ValueError('価格が不正です')
+        if values['high'] < max(values.values()) or values['low'] > min(values.values()):
+            raise ValueError('四本値の大小関係が不正です')
+        key = day.isoformat()
+        if key in rows:
+            raise ValueError('重複日付: ' + key)
+        rows[key] = {'date': key, **values}
+    if not rows:
+        raise ValueError('有効な日次データがありません')
+    return rows
+
+
+def run():
+    req = urllib.request.Request(URL, headers={'User-Agent': 'PersonalNikkeiCalendar/0.5'})
+    with urllib.request.urlopen(req, timeout=25) as response:
+        raw = response.read(20_000_001)
+    if len(raw) > 20_000_000:
+        raise ValueError('CSVが20MBを超えています')
+    rows = parse_csv(raw)
+    path = ROOT / 'data' / 'nikkei.json'
+    if path.exists():
+        old = json.loads(path.read_text(encoding='utf-8'))
+        if old.get('schema') == 1 and isinstance(old.get('rows'), list):
+            for record in old['rows']:
+                rows.setdefault(record['date'], record)
+    combined = [rows[key] for key in sorted(rows)]
+    payload = {'schema': 1, 'status': 'ready', 'source': SOURCE,
+               'updated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+               'rows': combined}
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n', encoding='utf-8')
+    temp.replace(path)
+    print('更新成功:', len(combined), '件、最新:', combined[-1]['date'])
+
+
+if __name__ == '__main__':
+    try:
+        run()
+    except Exception as exc:
+        print('更新失敗。既存データは変更していません:', exc, file=sys.stderr)
+        sys.exit(1)
