@@ -1,0 +1,30 @@
+name: Authorized Nikkei CSV refresh
+on:
+  schedule:
+    - cron: '30 8 * * 1-5' # 17:30 JST (weekdays); verify provider publishing time
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download authorized feed, validate, preserve history
+        env:
+          AUTHORIZED_NIKKEI_CSV_URL: ${{ secrets.AUTHORIZED_NIKKEI_CSV_URL }}
+          AUTHORIZED_NIKKEI_SOURCE_NAME: ${{ vars.AUTHORIZED_NIKKEI_SOURCE_NAME }}
+        run: python scripts/update_feed.py
+      - name: Publish if updated
+        run: |
+          if ! git diff --quiet -- data/nikkei.json; then
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git config user.name 'github-actions[bot]'
+            git add data/nikkei.json
+            git commit -m 'Update authorized Nikkei data'
+            git push
+          fi
