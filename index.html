@@ -124,4 +124,79 @@ async function loadPublishedFeed(manual=false){
 loadPublishedFeed();
 
 if('serviceWorker' in navigator && location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(()=>{});
+
+// Dropbox private-file reader. OAuth Authorization Code + PKCE, no app secret in browser.
+const DB_CLIENT_KEY='nikkei_dropbox_appkey_v1';
+const DB_AUTH_KEY='nikkei_dropbox_auth_v1';
+const DB_PATH='/NikkeiCalendar/nikkei_stock_average_daily_jp.csv';
+const dbRoot=document.createElement('section');dbRoot.className='panel';dbRoot.innerHTML=`
+<div class="section-title"><h2>Dropbox自動更新</h2></div>
+<div style="font-size:12px;color:#637588;line-height:1.65">非公開の <code>NikkeiCalendar/nikkei_stock_average_daily_jp.csv</code> を読み込みます。初回のみDropbox認証が必要です。<strong>GitHubにはCSVもアクセストークンもアップロードしません。</strong></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:9px">
+<input id="dbAppKey" aria-label="Dropbox App key" type="text" placeholder="Dropbox App key（初回のみ）" style="font-size:14px;min-width:160px;flex:1;padding:9px;border:1px solid #aab8c8;border-radius:8px" autocomplete="off">
+<button id="dbConnect" class="control" style="padding:9px;background:#e8f6ef;color:#146b42">Dropboxと接続</button>
+<button id="dbReload" class="control" style="padding:9px">最新CSVを取得</button>
+<button id="dbDisconnect" class="control" style="padding:9px">接続解除</button>
+</div><div id="dbStatus" role="status" style="font-size:12px;margin-top:8px;color:#52677d">未接続。Dropbox App key を設定してください。</div>`;
+const firstPanel=document.querySelector('main.app section.panel');firstPanel.parentElement.insertBefore(dbRoot,firstPanel);
+const $db=id=>document.getElementById(id);
+$db('dbAppKey').value=localStorage.getItem(DB_CLIENT_KEY)||'';
+const dbStatus=v=>$db('dbStatus').textContent=v;
+const dbReadAuth=()=>{try{return JSON.parse(localStorage.getItem(DB_AUTH_KEY)||'null')}catch{return null}};
+const dbSaveAuth=v=>localStorage.setItem(DB_AUTH_KEY,JSON.stringify(v));
+const redirectUri=location.origin+location.pathname;
+function bytesBase64Url(arr){return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+async function dbConnect(){
+ const key=$db('dbAppKey').value.trim(); if(!/^[a-zA-Z0-9]+$/.test(key)){dbStatus('Dropbox App key を入力してください。');return}
+ localStorage.setItem(DB_CLIENT_KEY,key);
+ const verifier=bytesBase64Url(crypto.getRandomValues(new Uint8Array(48)));
+ const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier)));
+ const state=bytesBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+ sessionStorage.setItem('db_pkce_pending',JSON.stringify({verifier,state}));
+ const qs=new URLSearchParams({client_id:key,response_type:'code',redirect_uri:redirectUri,code_challenge:bytesBase64Url(digest),code_challenge_method:'S256',token_access_type:'offline',state});
+ location.assign('https://www.dropbox.com/oauth2/authorize?'+qs);
+}
+async function dbTokenRequest(params){const r=await fetch('https://api.dropboxapi.com/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(params)});const data=await r.json();if(!r.ok)throw Error('Dropbox認証失敗：'+(data.error_description||data.error||r.status));return data;}
+async function dbFinishCallback(){
+ const params=new URLSearchParams(location.search);
+ const code=params.get('code'),state=params.get('state');if(!code)return;
+ history.replaceState(null,'',redirectUri+location.hash);
+ const pending=JSON.parse(sessionStorage.getItem('db_pkce_pending')||'null');sessionStorage.removeItem('db_pkce_pending');
+ if(!pending||pending.state!==state)throw Error('認証の安全確認に失敗しました。Safariから同じURLを開いて接続してください。');
+ const key=localStorage.getItem(DB_CLIENT_KEY);if(!key)throw Error('Dropbox App key が見つかりません');
+ const tokens=await dbTokenRequest({code,grant_type:'authorization_code',client_id:key,code_verifier:pending.verifier,redirect_uri:redirectUri});
+ dbSaveAuth({access_token:tokens.access_token,refresh_token:tokens.refresh_token,expires_at:Date.now()+(tokens.expires_in||14400)*1000-60000});
+}
+async function dbAccessToken(){
+ let t=dbReadAuth();if(!t)throw Error('未接続です。Dropboxと接続してください。');
+ if(t.expires_at>Date.now()+30000)return t.access_token;
+ if(!t.refresh_token)throw Error('認証の期限が切れました。再接続してください。');
+ const key=localStorage.getItem(DB_CLIENT_KEY);const next=await dbTokenRequest({grant_type:'refresh_token',refresh_token:t.refresh_token,client_id:key});
+ t={...t,access_token:next.access_token,expires_at:Date.now()+(next.expires_in||14400)*1000-60000};dbSaveAuth(t);return t.access_token;
+}
+async function dbReload(){
+ dbStatus('Dropboxの非公開CSVを確認しています…');
+ try{
+  const token=await dbAccessToken();
+  const response=await fetch('https://content.dropboxapi.com/2/files/download',{method:'POST',headers:{Authorization:'Bearer '+token,'Dropbox-API-Arg':JSON.stringify({path:DB_PATH})},cache:'no-store'});
+  if(!response.ok){const tx=await response.text();throw Error('Dropboxの取得に失敗しました（HTTP '+response.status+'）'+(response.status===409?'。ファイルの場所とアクセス権を確認してください。':''));}
+  const b=await response.arrayBuffer();if(b.byteLength>15*1024*1024)throw Error('CSVが15MBを超えています');
+  const decoded=new TextDecoder('shift_jis',{fatal:true}).decode(b);
+  const rows=parseCsv(decoded);
+  // Only write a fully validated snapshot. Do not publish to GitHub.
+  localStorage.setItem(STORAGE_KEY,JSON.stringify(rows));
+  userCsvActive=true;switchToReal(rows);
+  $('modepill').textContent='Dropbox実データ';$('sourcelabel').textContent='Dropbox非公開CSV（日経公式から利用者が取得）';
+  $('updatelabel').textContent='カレンダー起動時にDropboxから自動確認';
+  $('statusnotice').innerHTML='<strong>Dropboxから取得した日経平均を表示中。</strong> 未接続・通信失敗時は保存済みデータを表示します。';
+  const stamp=new Date().toLocaleString('ja-JP');dbStatus('取得成功：'+rows.length+'営業日分／確認日時 '+stamp);
+  $('refreshmsg').textContent='Dropbox最終取得：'+stamp;
+ }catch(err){dbStatus('自動取得できません：'+err.message+'。保存済みデータは保持します。');}
+}
+$db('dbConnect').addEventListener('click',()=>dbConnect().catch(e=>dbStatus(e.message)));
+$db('dbReload').addEventListener('click',()=>dbReload());
+$db('dbDisconnect').addEventListener('click',()=>{localStorage.removeItem(DB_AUTH_KEY);dbStatus('Dropboxの接続を解除しました。保存済み株価データは維持します。');});
+(async()=>{try{await dbFinishCallback();if(dbReadAuth())await dbReload()}catch(e){dbStatus('認証または取得エラー：'+e.message)}})();
+document.addEventListener('visibilitychange',()=>{if(!document.hidden && dbReadAuth())dbReload()});
+
 </script></body></html>
